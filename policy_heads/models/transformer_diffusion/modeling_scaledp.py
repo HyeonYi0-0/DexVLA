@@ -23,6 +23,8 @@ from timm.models.vision_transformer import Mlp, use_fused_attn
 from transformers.modeling_utils import PreTrainedModel
 from transformers import AutoModel, AutoModelForCausalLM
 
+import kornia
+
 _logger = logging.getLogger(__name__)
 
 
@@ -189,6 +191,54 @@ class FinalLayer(nn.Module):
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
+    
+def prob_mask_like(shape, prob, device):
+    if prob == 1:
+        return torch.ones(shape, device = device, dtype = torch.bool)
+    elif prob == 0:
+        return torch.zeros(shape, device = device, dtype = torch.bool)
+    else:
+        return torch.zeros(shape, device = device).float().uniform_(0, 1) < prob
+    
+def get_tracking_error(x_pos, x_ori, a_pos, a_ori):
+    """
+    Compute tracking error for end-effector pose.
+    Assumes quaternion representation is (w, x, y, z), consistent with MuJoCo.
+
+    :param x_pos: current end-effector position, torch.Tensor (..., 3)
+    :param x_ori: current end-effector orientation, torch.Tensor (..., 4) for quaternion or (..., 3) for Euler angles
+    :param a_pos: target position, torch.Tensor (..., 3)
+    :param a_ori: target orientation, torch.Tensor (..., 4) for quaternion or (..., 3) for Euler angles
+    :param representation: string, 'quaternion' or 'euler'
+    :return: (e_pos, e_ori) position error and orientation error
+    """
+    # Position error
+    delta_p = a_pos - x_pos
+    e_pos = torch.linalg.norm(delta_p, dim=-1)
+
+    # Orientation error
+    if x_ori.shape[-1] == 4 and a_ori.shape[-1] == 4:
+        # kornia's quaternion_to_rotation_matrix expects (w, x, y, z), which matches MuJoCo.
+        R_x = kornia.geometry.quaternion_to_rotation_matrix(x_ori)
+        R_a = kornia.geometry.quaternion_to_rotation_matrix(a_ori)
+
+    elif x_ori.shape[-1] == 3 and a_ori.shape[-1] == 3:
+        R_x = kornia.geometry.conversions.angle_axis_to_rotation_matrix(x_ori)
+        R_a = kornia.geometry.conversions.angle_axis_to_rotation_matrix(a_ori)
+    else:
+        raise ValueError("Unsupported representation. Use 'quaternion' or 'euler'.")
+
+    # Orientation error calculation using rotation matrices
+    R_delta = torch.matmul(R_a.transpose(-2, -1), R_x)
+    trace_val = torch.diagonal(R_delta, dim1=-2, dim2=-1).sum(-1)
+
+    cos_theta = (trace_val - 1) / 2.0
+
+    # Numerical stability correction
+    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+    e_ori = torch.arccos(cos_theta)
+
+    return e_pos, e_ori
 
 from .configuration_scaledp import ScaleDPPolicyConfig
 class ScaleDP(PreTrainedModel):
@@ -270,6 +320,12 @@ class ScaleDP(PreTrainedModel):
         self.num_queries = config.num_queries #16
         self.noise_samples = config.noise_samples # 1
         # self.num_inference_timesteps = config.num_inference_timesteps # 100
+        
+        self.cfg_drop_prob = config.cfg_drop_prob
+        self.cfg_guide_scale = config.cfg_guide_scale
+        self.cond_horizon = config.cond_horizon
+        self.pos_threshold = config.pos_threshold
+        self.ori_threshold = config.ori_threshold
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -406,7 +462,6 @@ class ScaleDP(PreTrainedModel):
 
             noisy_actions = noisy_actions.to(dtype=actions.dtype)
             assert hidden_states.ndim == 3
-
             hidden_states = hidden_states.repeat(num_noise_samples, 1, 1)
             timesteps = timesteps.repeat(num_noise_samples)
             is_pad = is_pad.repeat(num_noise_samples, 1)
@@ -476,6 +531,113 @@ class ScaleDP(PreTrainedModel):
             x = block(x, c, attn_mask=None)  # (N, T, D)
         x = self.final_layer(x, c)  # (N, T, output_dim)
         return x
+    
+    def error_adaptive_guidance(self, prev_actions, naction, k, hidden_states, states):
+        eff_pos = states[:, :7]
+        e_pos, e_ori = get_tracking_error(
+            x_pos=eff_pos[:, :3].squeeze(),
+            x_ori=eff_pos[:, 3:].squeeze(),
+            a_pos=prev_actions[:, :1, :3].squeeze(),
+            a_ori=prev_actions[:, :1, 3:].squeeze(),
+        )
+        guidance_scale = 0.0
+        if e_pos <= self.pos_threshold and e_ori <= self.ori_threshold:   
+            cond_actions = prev_actions[:, :self.cond_horizon, :].reshape(1, -1)
+            cond_states = torch.cat([states, cond_actions], dim=-1) if states is not None else cond_actions
+            cond = self.model_forward(naction, k, global_cond=hidden_states, states=cond_states)
+            guidance_scale = self.cfg_guide_scale
+        
+        uncond_actions = torch.zeros_like(cond_actions)
+        ucond_states = torch.cat([states, uncond_actions], dim=-1) if states is not None else uncond_actions
+        uncond = self.model_forward(naction, k, global_cond=hidden_states, states=ucond_states)
+        # CFG
+        noise_pred = uncond + guidance_scale * (cond - uncond)
+        return noise_pred
+    
+    def forward_with_cfg(self, actions, hidden_states, states, is_pad, prev_actions):
+        """
+        Forward pass for the diffusion head with Classifier-free-guidance (CFG) based on SAIL paper.
+        :param actions: target actions, shape [B, Ta, D] D:10 = 3+6+1
+        :param hidden_states: hidden states from the llava_pythia, as the conScaleDPion for the diffusion, shape [B,Tokens, D] 8 1200 1024
+        :param states: robot states, shape [B, D]
+        :return: loss
+        """
+        if actions is not None:  # training time
+            B = actions.size(0)
+            actions = actions[:, :self.num_queries]
+            is_pad = is_pad[:, :self.num_queries]
+            num_noise_samples = self.noise_samples
+            # sample noise to add to actions
+            noise = torch.randn([num_noise_samples] + list(actions.shape), device=actions.device,
+                                dtype=actions.dtype)  # num_noise, B, Ta, D(1, 2, 16, 14)
+            # sample a diffusion iteration for each data point
+            timesteps = torch.randint(
+                0, self.noise_scheduler.config.num_train_timesteps,
+                (B,), device=actions.device
+            ).long()
+
+            timesteps, noise = timesteps.to(actions.device), noise.to(actions.device)
+
+            # add noise to the clean actions according to the noise magnitude at each diffusion iteration
+            # (this is the forward diffusion process)
+            noisy_actions = torch.cat([self.noise_scheduler.add_noise(
+                actions, noise[i], timesteps)
+                for i in range(len(noise))], dim=0)  # [num_noise_samples * B, Ta, action_dim]
+
+            noisy_actions = noisy_actions.to(dtype=actions.dtype)
+            assert hidden_states.ndim == 3
+            
+            cond_actions = actions[:, :self.cond_horizon, :].reshape(B, -1)
+            assert cond_actions.shape == (B, self.cond_horizon * self.action_dim)
+            
+            if self.cfg_drop_prob > 0.0:
+                prob_keep_mask = prob_mask_like((B, 1), 1.0 - self.cfg_drop_prob, device=actions.device)
+                uncond_actions = torch.zeros_like(cond_actions)
+                cond_actions = torch.where(
+                    prob_keep_mask,
+                    cond_actions,
+                    uncond_actions
+                )
+                
+            states = torch.cat([states, cond_actions], dim=-1)
+
+            hidden_states = hidden_states.repeat(num_noise_samples, 1, 1)
+            timesteps = timesteps.repeat(num_noise_samples)
+            is_pad = is_pad.repeat(num_noise_samples, 1)
+            states = states.repeat(num_noise_samples,  1)
+
+            noise_pred = self.model_forward(noisy_actions, timesteps, global_cond=hidden_states, states=states)
+            noise = noise.view(noise.size(0) * noise.size(1), *noise.size()[2:])
+            loss = torch.nn.functional.mse_loss(noise_pred, noise, reduction='none')
+            loss = (loss * ~is_pad.unsqueeze(-1)).mean()
+            # loss_dict['loss'] = loss
+            return {'loss': loss}
+            # return loss
+        elif prev_actions:  # inference time
+            B = 1
+            Tp = self.num_queries
+            action_dim = self.action_dim
+
+            # initialize action from Guassian noise
+            noisy_action = torch.randn((B, Tp, action_dim)).cuda()
+
+            naction = noisy_action.to(dtype=hidden_states.dtype)
+            # init scheduler
+            self.noise_scheduler.set_timesteps(self.num_inference_timesteps)
+
+            for k in self.noise_scheduler.timesteps:
+                # Error-adaptive-guidance (EAG)
+                # CFG
+                noise_pred = self.error_adaptive_guidance(prev_actions, naction, k, hidden_states, states)
+
+                # inverse diffusion step (remove noise)
+                naction = self.noise_scheduler.step(
+                    model_output=noise_pred,
+                    timestep=k,
+                    sample=naction
+                ).prev_sample
+
+            return naction
 
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #

@@ -1468,6 +1468,8 @@ class Qwen2VLForConditionalGenerationForVLA(Qwen2VLPreTrainedModel, GenerationMi
             # Initialize projection layers and condition modulation layers
             self.reasoning_action_proj = ActionProjector(config.hidden_size, config.hidden_size)
             self.reasoning_film = FiLM(feature_dim=config.hidden_size, condition_dim=config.hidden_size)
+            
+        self.future_action_cond = config.future_action_cond
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1834,7 +1836,10 @@ class Qwen2VLForConditionalGenerationForVLA(Qwen2VLPreTrainedModel, GenerationMi
         else: 
             action_hidden_states = hidden_states
 
-        ret = self.policy_head(actions=actions, hidden_states=action_hidden_states, states=states, is_pad=is_pad)
+        if self.future_action_cond:
+            ret = self.policy_head.forward_with_cfg(actions=actions, hidden_states=action_hidden_states, states=states, is_pad=is_pad, prev_actions=None)
+        else:
+            ret = self.policy_head(actions=actions, hidden_states=action_hidden_states, states=states, is_pad=is_pad)
 
         loss = {'loss': ret['loss'] + self.llm_loss_weight * llm_loss,
                 'llm_loss': llm_loss,
@@ -2032,8 +2037,10 @@ class Qwen2VLForConditionalGenerationForVLA(Qwen2VLPreTrainedModel, GenerationMi
                                                      input_ids=output_ids,
                                                      hidden_states=torch.cat(last_hidden_states, dim=1))
 
-
-        action = self.policy_head(actions, action_hidden_states, states.to(all_hidden_states.dtype), is_pad)
+        if self.future_action_cond:
+            action = self.policy_head.forward_with_cfg(actions=None, hidden_states=action_hidden_states, states=states.to(all_hidden_states.dtype), is_pad=is_pad, prev_actions=actions)
+        else:
+            action = self.policy_head(actions, action_hidden_states, states.to(all_hidden_states.dtype), is_pad)
         return action, outputs_text
 
     def evaluate_tinyvla(self,
@@ -2057,7 +2064,10 @@ class Qwen2VLForConditionalGenerationForVLA(Qwen2VLPreTrainedModel, GenerationMi
 
         all_hidden_states = torch.mean(all_hidden_states, dim=1).unsqueeze(1)
         
-        action = self.policy_head(actions, all_hidden_states, states.to(all_hidden_states.dtype), is_pad)
+        if self.future_action_cond:
+            action = self.policy_head.forward_with_cfg(actions=None, hidden_states=all_hidden_states, states=states.to(all_hidden_states.dtype), is_pad=is_pad, prev_actions=actions)
+        else:
+            action = self.policy_head(actions, all_hidden_states, states.to(all_hidden_states.dtype), is_pad)
         return action, "tinyvla no output"
 
 from transformers import AutoModelForCausalLM
